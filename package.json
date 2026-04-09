@@ -1,0 +1,14 @@
+{
+  "name": "contenthub-twitter-server",
+  "version": "2.0.0",
+  "description": "Twitter OAuth proxy + scheduler for ContentHub Pro",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "oauth-1.0a": "^2.2.6",
+    "node-fetch": "^2.7.0",
+    "@supabase/supabase-js": "^2.39.0"
+  }
+}
