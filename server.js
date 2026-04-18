@@ -37,10 +37,15 @@ async function postTweet(text, replyToId, apiKey, apiSecret, accessToken, access
   const { oauth, token } = makeOAuth(apiKey, apiSecret, accessToken, accessSecret);
   const body = { text };
   if (replyToId) body.reply = { in_reply_to_tweet_id: replyToId };
+  // Twitter API v2: OAuth signs URL only, body is JSON (not form-encoded)
   const authHeader = oauth.toHeader(oauth.authorize({ url, method: 'POST' }, token));
   const res = await fetch(url, {
     method: 'POST',
-    headers: { ...authHeader, 'Content-Type': 'application/json', 'User-Agent': 'ContentHubPro/2.0' },
+    headers: {
+      ...authHeader,
+      'Content-Type': 'application/json',
+      'User-Agent': 'ContentHubPro/2.0'
+    },
     body: JSON.stringify(body)
   });
   const data = await res.json();
@@ -55,15 +60,23 @@ async function postThread(tweets, apiKey, apiSecret, accessToken, accessSecret) 
   for (let i = 0; i < tweets.length; i++) {
     const text = tweets[i];
     if (!text?.trim()) continue;
-    if (i > 0) await new Promise(r => setTimeout(r, 1200));
-    const tweet = await postTweet(text.trim(), lastId, apiKey, apiSecret, accessToken, accessSecret);
-    lastId = tweet.id;
-    results.push({
-      index: i + 1,
-      tweetId: tweet.id,
-      tweetUrl: `https://x.com/i/web/status/${tweet.id}`,
-      text: text.trim().substring(0, 60) + '…'
-    });
+    if (i > 0) await new Promise(r => setTimeout(r, 3000)); // 3s gap between tweets
+    try {
+      console.log(`[Thread] Posting tweet ${i+1}/${tweets.length}${lastId ? ' as reply to '+lastId : ''}`);
+      const tweet = await postTweet(text.trim(), lastId, apiKey, apiSecret, accessToken, accessSecret);
+      lastId = tweet.id;
+      console.log(`[Thread] Tweet ${i+1} posted: ${tweet.id}`);
+      results.push({
+        index: i + 1,
+        tweetId: tweet.id,
+        tweetUrl: `https://x.com/i/web/status/${tweet.id}`,
+        text: text.trim().substring(0, 60) + '…'
+      });
+    } catch(e) {
+      console.error(`[Thread] Tweet ${i+1} FAILED:`, e.message);
+      // Return partial results with error info
+      throw new Error(`Thread failed at tweet ${i+1}: ${e.message}. Posted ${results.length} tweets successfully.`);
+    }
   }
   return results;
 }
@@ -90,7 +103,8 @@ app.post('/thread', async (req, res) => {
     const results = await postThread(tweets, apiKey, apiSecret, accessToken, accessSecret);
     res.json({ success: true, threadCount: results.length, firstTweetUrl: results[0]?.tweetUrl, tweets: results });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('[/thread] Error:', e.message);
+    res.status(500).json({ error: e.message, partial: true });
   }
 });
 
