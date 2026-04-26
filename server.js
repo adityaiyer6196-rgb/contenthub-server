@@ -3,7 +3,6 @@ const cors = require('cors');
 const OAuth = require('oauth-1.0a');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
-const FormData = require('form-data');
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -13,8 +12,8 @@ app.options('*', cors());
 app.get('/', (req, res) => {
   res.json({
     status: 'ContentHub Twitter Server ✅',
-    version: '4.0.0',
-    note: 'Images + threads fully working'
+    version: '4.0.1',
+    note: 'Now using X v2 JSON media upload (no FormData needed)'
   });
 });
 
@@ -30,7 +29,7 @@ function makeOAuth(apiKey, apiSecret, accessToken, accessSecret) {
   return { oauth, token: { key: accessToken, secret: accessSecret } };
 }
 
-// ── FINAL FIXED Image Upload (with correct multipart headers) ──
+// ── NEW: X v2 JSON-based media upload (this is the official way now) ──
 async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) {
   if (!imageUrl) return null;
   try {
@@ -56,23 +55,24 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
     }
 
     const sizeKB = Math.round(base64Data.length * 0.75 / 1024);
-    console.log(`[media] Uploading ~${sizeKB}KB (${mimeType})...`);
+    console.log(`[media] Uploading ~${sizeKB}KB (${mimeType}) via JSON...`);
 
     const uploadUrl = 'https://api.x.com/2/media/upload';
     const { oauth, token } = makeOAuth(apiKey, apiSecret, accessToken, accessSecret);
     const authHeader = oauth.toHeader(oauth.authorize({ url: uploadUrl, method: 'POST' }, token));
 
-    const form = new FormData();
-    form.append('media_data', base64Data);
-    form.append('media_category', 'tweet_image');
+    const body = {
+      media: base64Data,
+      media_category: 'tweet_image'
+    };
 
     const uploadRes = await fetch(uploadUrl, {
       method: 'POST',
       headers: {
         'Authorization': authHeader.Authorization,
-        ...form.getHeaders()   // ← THIS FIXES THE 400 ERROR
+        'Content-Type': 'application/json'
       },
-      body: form
+      body: JSON.stringify(body)
     });
 
     const uploadData = await uploadRes.json();
@@ -82,7 +82,7 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
       throw new Error(`Media upload failed (${uploadRes.status}): ${uploadData.detail || uploadData.title || JSON.stringify(uploadData)}`);
     }
 
-    const mediaId = uploadData.data?.id || uploadData.media_id_string || uploadData.id;
+    const mediaId = uploadData.data?.id || uploadData.id;
     if (!mediaId) throw new Error('No media_id in response');
 
     console.log(`[media] ✅ media_id: ${mediaId}`);
@@ -121,7 +121,7 @@ async function postTweet(text, replyToId, mediaId, apiKey, apiSecret, accessToke
   return data.data;
 }
 
-// ── Endpoints ──
+// ── Endpoints (unchanged) ──
 app.post('/tweet', async (req, res) => {
   const { text, apiKey, apiSecret, accessToken, accessSecret, replyToId, imageUrl } = req.body;
   if (!text || !apiKey || !apiSecret || !accessToken || !accessSecret) return res.status(400).json({ error: 'Missing fields' });
