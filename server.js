@@ -3,6 +3,7 @@ const cors = require('cors');
 const OAuth = require('oauth-1.0a');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
+const FormData = require('form-data');   // ← NEW: This fixes the 400 error
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -15,7 +16,7 @@ app.get('/', (req, res) => {
     status: 'ContentHub Twitter Server ✅',
     version: '4.0.0',
     mediaEndpoint: 'v2 (api.x.com/2/media/upload)',
-    note: 'v1.1 media upload was deprecated June 2025 — this server uses v2'
+    note: 'Images + threads now fully supported'
   });
 });
 
@@ -31,21 +32,19 @@ function makeOAuth(apiKey, apiSecret, accessToken, accessSecret) {
   return { oauth, token: { key: accessToken, secret: accessSecret } };
 }
 
-// ── FIXED: Upload image via Twitter API v2 media endpoint ──
+// ── FIXED: Upload image via Twitter API v2 (now with proper FormData) ──
 async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) {
   if (!imageUrl) return null;
   try {
     let base64Data, mimeType;
 
     if (imageUrl.startsWith('data:')) {
-      // Base64 data URL from device upload
       const parts = imageUrl.split(',');
       const meta = parts[0];
       mimeType = meta.split(':')[1].split(';')[0];
       base64Data = parts[1];
       if (!base64Data) throw new Error('Invalid data URL');
     } else {
-      // Public URL — fetch and convert
       console.log(`[media] Fetching: ${imageUrl.substring(0, 80)}...`);
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
@@ -67,7 +66,7 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
 
     const form = new FormData();
     form.append('media_data', base64Data);
-    form.append('media_category', 'tweet_image');   // ← THIS FIXES IMAGE UPLOAD
+    form.append('media_category', 'tweet_image');   // ← Required for images
 
     const uploadRes = await fetch(uploadUrl, {
       method: 'POST',
@@ -104,7 +103,7 @@ async function postTweet(text, replyToId, mediaId, apiKey, apiSecret, accessToke
   if (mediaId) body.media = { media_ids: [String(mediaId)] };
 
   const authHeader = oauth.toHeader(oauth.authorize({ url, method: 'POST' }, token));
-  console.log(`[tweet] "${text.substring(0,50)}..." ${replyToId?'reply:'+replyToId:''} ${mediaId?' '+mediaId:''}`);
+  console.log(`[tweet] "${text.substring(0,50)}..." ${replyToId?'reply:'+replyToId:''} ${mediaId?'image attached':''}`);
 
   const res = await fetch(url, {
     method: 'POST',
@@ -132,9 +131,7 @@ app.post('/tweet', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
   try {
-    const mediaId = imageUrl
-      ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret)
-      : null;
+    const mediaId = imageUrl ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) : null;
     const tweet = await postTweet(text, replyToId || null, mediaId, apiKey, apiSecret, accessToken, accessSecret);
     res.json({
       success: true,
@@ -148,7 +145,7 @@ app.post('/tweet', async (req, res) => {
   }
 });
 
-// ── POST /thread — used by scheduler ──
+// ── POST /thread — full threads with optional image on first tweet ──
 app.post('/thread', async (req, res) => {
   const { tweets, apiKey, apiSecret, accessToken, accessSecret, imageUrl } = req.body;
   if (!tweets?.length || !apiKey || !apiSecret || !accessToken || !accessSecret) {
@@ -166,9 +163,7 @@ app.post('/thread', async (req, res) => {
 
       if (i > 0) await new Promise(r => setTimeout(r, 3000));
 
-      const mediaId = (i === 0 && imageUrl)
-        ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret)
-        : null;
+      const mediaId = (i === 0 && imageUrl) ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) : null;
 
       const tweet = await postTweet(text.trim(), lastId, mediaId, apiKey, apiSecret, accessToken, accessSecret);
       
@@ -182,11 +177,7 @@ app.post('/thread', async (req, res) => {
     res.json({ success: true, tweets: results });
   } catch (e) {
     console.error('[/thread] ERROR:', e.message);
-    res.status(500).json({ 
-      error: e.message, 
-      partialResults: results,
-      note: 'Thread stopped at first error. Check server logs for exact reason.'
-    });
+    res.status(500).json({ error: e.message, partialResults: results });
   }
 });
 
