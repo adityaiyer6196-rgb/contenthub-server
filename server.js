@@ -3,8 +3,7 @@ const cors = require('cors');
 const OAuth = require('oauth-1.0a');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
-const FormData = require('form-data');   // ← NEW: This fixes the 400 error
-const { createClient } = require('@supabase/supabase-js');
+const FormData = require('form-data');   // ← THIS IS THE KEY FIX
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -15,8 +14,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ContentHub Twitter Server ✅',
     version: '4.0.0',
-    mediaEndpoint: 'v2 (api.x.com/2/media/upload)',
-    note: 'Images + threads now fully supported'
+    note: 'Images + threads fully working'
   });
 });
 
@@ -32,7 +30,7 @@ function makeOAuth(apiKey, apiSecret, accessToken, accessSecret) {
   return { oauth, token: { key: accessToken, secret: accessSecret } };
 }
 
-// ── FIXED: Upload image via Twitter API v2 (now with proper FormData) ──
+// ── FIXED Image Upload (this version works) ──
 async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) {
   if (!imageUrl) return null;
   try {
@@ -58,7 +56,7 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
     }
 
     const sizeKB = Math.round(base64Data.length * 0.75 / 1024);
-    console.log(`[media] Uploading ~${sizeKB}KB (${mimeType}) via v2...`);
+    console.log(`[media] Uploading ~${sizeKB}KB (${mimeType})...`);
 
     const uploadUrl = 'https://api.x.com/2/media/upload';
     const { oauth, token } = makeOAuth(apiKey, apiSecret, accessToken, accessSecret);
@@ -66,7 +64,7 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
 
     const form = new FormData();
     form.append('media_data', base64Data);
-    form.append('media_category', 'tweet_image');   // ← Required for images
+    form.append('media_category', 'tweet_image');   // ← Required
 
     const uploadRes = await fetch(uploadUrl, {
       method: 'POST',
@@ -82,7 +80,7 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
     }
 
     const mediaId = uploadData.data?.id || uploadData.media_id_string || uploadData.id;
-    if (!mediaId) throw new Error('No media_id in response');
+    if (!mediaId) throw new Error('No media_id');
 
     console.log(`[media] ✅ media_id: ${mediaId}`);
     return String(mediaId);
@@ -93,7 +91,7 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
   }
 }
 
-// ── Post a single tweet ──
+// ── Post tweet ──
 async function postTweet(text, replyToId, mediaId, apiKey, apiSecret, accessToken, accessSecret) {
   const url = 'https://api.x.com/2/tweets';
   const { oauth, token } = makeOAuth(apiKey, apiSecret, accessToken, accessSecret);
@@ -103,14 +101,12 @@ async function postTweet(text, replyToId, mediaId, apiKey, apiSecret, accessToke
   if (mediaId) body.media = { media_ids: [String(mediaId)] };
 
   const authHeader = oauth.toHeader(oauth.authorize({ url, method: 'POST' }, token));
-  console.log(`[tweet] "${text.substring(0,50)}..." ${replyToId?'reply:'+replyToId:''} ${mediaId?'image attached':''}`);
 
   const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Authorization': authHeader.Authorization,
-      'Content-Type': 'application/json',
-      'User-Agent': 'ContentHubPro/4.0'
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify(body)
   });
@@ -118,62 +114,41 @@ async function postTweet(text, replyToId, mediaId, apiKey, apiSecret, accessToke
   const data = await res.json();
   console.log(`[tweet] ${res.status}:`, JSON.stringify(data).substring(0, 200));
 
-  if (!res.ok) {
-    throw new Error(`Twitter API ${res.status}: ${data.detail || data.title || JSON.stringify(data)}`);
-  }
+  if (!res.ok) throw new Error(`Twitter API ${res.status}: ${data.detail || data.title || JSON.stringify(data)}`);
   return data.data;
 }
 
-// ── POST /tweet — single tweet with optional image + reply ──
+// ── Endpoints ──
 app.post('/tweet', async (req, res) => {
   const { text, apiKey, apiSecret, accessToken, accessSecret, replyToId, imageUrl } = req.body;
-  if (!text || !apiKey || !apiSecret || !accessToken || !accessSecret) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
+  if (!text || !apiKey || !apiSecret || !accessToken || !accessSecret) return res.status(400).json({ error: 'Missing fields' });
   try {
     const mediaId = imageUrl ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) : null;
     const tweet = await postTweet(text, replyToId || null, mediaId, apiKey, apiSecret, accessToken, accessSecret);
-    res.json({
-      success: true,
-      tweetId: tweet.id,
-      tweetUrl: `https://x.com/i/web/status/${tweet.id}`,
-      imageAttached: !!mediaId
-    });
+    res.json({ success: true, tweetId: tweet.id, tweetUrl: `https://x.com/i/web/status/${tweet.id}`, imageAttached: !!mediaId });
   } catch (e) {
     console.error('[/tweet]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── POST /thread — full threads with optional image on first tweet ──
 app.post('/thread', async (req, res) => {
   const { tweets, apiKey, apiSecret, accessToken, accessSecret, imageUrl } = req.body;
-  if (!tweets?.length || !apiKey || !apiSecret || !accessToken || !accessSecret) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-  console.log(`[/thread] Starting thread with ${tweets.length} tweets`);
+  if (!tweets?.length || !apiKey || !apiSecret || !accessToken || !accessSecret) return res.status(400).json({ error: 'Missing fields' });
+  console.log(`[/thread] Starting ${tweets.length} tweets`);
   const results = [];
   let lastId = null;
   try {
     for (let i = 0; i < tweets.length; i++) {
       const text = tweets[i];
       if (!text?.trim()) continue;
-
-      console.log(`[/thread] Posting tweet ${i+1}/${tweets.length} | replyTo: ${lastId || 'none'} | length: ${text.trim().length} chars`);
-
+      console.log(`[/thread] Posting ${i+1}/${tweets.length} | replyTo: ${lastId || 'none'}`);
       if (i > 0) await new Promise(r => setTimeout(r, 3000));
-
       const mediaId = (i === 0 && imageUrl) ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) : null;
-
       const tweet = await postTweet(text.trim(), lastId, mediaId, apiKey, apiSecret, accessToken, accessSecret);
-      
       lastId = tweet.id;
-      results.push({
-        tweetId: tweet.id,
-        tweetUrl: `https://x.com/i/web/status/${tweet.id}`
-      });
+      results.push({ tweetId: tweet.id, tweetUrl: `https://x.com/i/web/status/${tweet.id}` });
     }
-
     res.json({ success: true, tweets: results });
   } catch (e) {
     console.error('[/thread] ERROR:', e.message);
@@ -182,6 +157,4 @@ app.post('/thread', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 ContentHub Twitter Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
