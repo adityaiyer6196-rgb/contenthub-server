@@ -11,7 +11,12 @@ app.use(express.json({ limit: '50mb' }));
 app.options('*', cors());
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ContentHub Twitter Server ✅', version: '3.2.0' });
+  res.json({
+    status: 'ContentHub Twitter Server ✅',
+    version: '4.0.0',
+    mediaEndpoint: 'v2 (api.x.com/2/media/upload)',
+    note: 'v1.1 media upload was deprecated June 2025 — this server uses v2'
+  });
 });
 
 // ── OAuth 1.0a ──
@@ -26,123 +31,134 @@ function makeOAuth(apiKey, apiSecret, accessToken, accessSecret) {
   return { oauth, token: { key: accessToken, secret: accessSecret } };
 }
 
-// ── Upload image via multipart/form-data (correct OAuth signing) ──
-async function uploadBase64ToTwitter(base64Data, apiKey, apiSecret, accessToken, accessSecret) {
-  const url = 'https://upload.twitter.com/1.1/media/upload.json';
-  const { oauth, token } = makeOAuth(apiKey, apiSecret, accessToken, accessSecret);
-
-  // For multipart POST: sign only URL+method, NOT the body — this is correct per OAuth 1.0a spec
-  const authHeader = oauth.toHeader(oauth.authorize({ url, method: 'POST' }, token));
-
-  const sizeKB = Math.round(base64Data.length * 0.75 / 1024);
-  console.log(`[uploadMedia] Uploading via multipart (~${sizeKB}KB decoded)...`);
-
-  // Use multipart/form-data — correct for binary data and large files
-  // Node 18+ has built-in FormData
-  const form = new FormData();
-  form.append('media_data', base64Data);
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': authHeader.Authorization
-      // Do NOT set Content-Type manually — fetch sets it with boundary for FormData
-    },
-    body: form
-  });
-
-  const data = await res.json();
-  console.log(`[uploadMedia] Response ${res.status}:`, JSON.stringify(data).substring(0, 200));
-
-  if (!res.ok || !data.media_id_string) {
-    const errMsg = data.errors?.[0]?.message || data.detail || JSON.stringify(data);
-    throw new Error(`Media upload failed (${res.status}): ${errMsg}`);
-  }
-
-  console.log(`[uploadMedia] ✅ media_id: ${data.media_id_string}`);
-  return data.media_id_string;
-}
-
-// ── Get base64 from any image source (data: URL or public URL) ──
-async function getBase64FromSource(imageUrl) {
-  if (!imageUrl) return null;
-
-  if (imageUrl.startsWith('data:')) {
-    // Already base64 — extract the data part
-    const base64 = imageUrl.split(',')[1];
-    if (!base64) throw new Error('Invalid data URL — no base64 content');
-    return base64;
-  }
-
-  // Public URL — fetch and convert
-  console.log(`[uploadMedia] Fetching image from: ${imageUrl.substring(0, 80)}...`);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const res = await fetch(imageUrl, { signal: controller.signal });
-    clearTimeout(timer);
-    if (!res.ok) throw new Error(`HTTP ${res.status} fetching image`);
-    const buffer = await res.buffer();
-    return buffer.toString('base64');
-  } catch (e) {
-    clearTimeout(timer);
-    throw new Error(`Could not fetch image: ${e.message}`);
-  }
-}
-
-// ── Upload image to Twitter (main entry point) ──
+// ── Upload image via Twitter API v2 media endpoint ──
+// v1.1 (upload.twitter.com/1.1/media/upload) was deprecated June 2025
+// v2 endpoint: POST https://api.x.com/2/media/upload
 async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) {
   if (!imageUrl) return null;
   try {
-    const base64 = await getBase64FromSource(imageUrl);
-    if (!base64) return null;
-    return await uploadBase64ToTwitter(base64, apiKey, apiSecret, accessToken, accessSecret);
+    let base64Data, mimeType;
+
+    if (imageUrl.startsWith('data:')) {
+      // Base64 data URL from device upload
+      const parts = imageUrl.split(',');
+      const meta = parts[0]; // e.g. data:image/jpeg;base64
+      mimeType = meta.split(':')[1].split(';')[0]; // e.g. image/jpeg
+      base64Data = parts[1];
+      if (!base64Data) throw new Error('Invalid data URL');
+    } else {
+      // Public URL — fetch and convert
+      console.log(`[media] Fetching: ${imageUrl.substring(0, 80)}...`);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      const imgRes = await fetch(imageUrl, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status} fetching image`);
+      const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
+      mimeType = contentType.split(';')[0];
+      const buffer = await imgRes.buffer();
+      base64Data = buffer.toString('base64');
+    }
+
+    const sizeKB = Math.round(base64Data.length * 0.75 / 1024);
+    console.log(`[media] Uploading ~${sizeKB}KB (${mimeType}) via v2 endpoint...`);
+
+    // Twitter API v2 media upload
+    // Uses multipart/form-data — OAuth signs URL only (correct per spec)
+    const uploadUrl = 'https://api.x.com/2/media/upload';
+    const { oauth, token } = makeOAuth(apiKey, apiSecret, accessToken, accessSecret);
+    const authHeader = oauth.toHeader(oauth.authorize({ url: uploadUrl, method: 'POST' }, token));
+
+    const form = new FormData();
+    form.append('media_data', base64Data);
+    if (mimeType) form.append('media_type', mimeType);
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: { 'Authorization': authHeader.Authorization },
+      body: form
+    });
+
+    const uploadData = await uploadRes.json();
+    console.log(`[media] Response ${uploadRes.status}:`, JSON.stringify(uploadData).substring(0, 300));
+
+    if (!uploadRes.ok) {
+      throw new Error(`Media upload failed (${uploadRes.status}): ${uploadData.detail || uploadData.title || JSON.stringify(uploadData)}`);
+    }
+
+    // v2 returns media_id in different places depending on response format
+    const mediaId = uploadData.data?.id || uploadData.media_id_string || uploadData.id;
+    if (!mediaId) throw new Error('No media_id in response: ' + JSON.stringify(uploadData));
+
+    console.log(`[media] ✅ media_id: ${mediaId}`);
+    return String(mediaId);
+
   } catch (e) {
-    console.warn('[uploadMedia] Image upload failed — tweet will post without image:', e.message);
-    return null; // Never block the tweet over an image failure
+    console.error('[media] Upload failed:', e.message);
+    return null; // Don't block the tweet
   }
 }
 
 // ── Post a single tweet ──
 async function postTweet(text, replyToId, mediaId, apiKey, apiSecret, accessToken, accessSecret) {
-  const url = 'https://api.twitter.com/2/tweets';
+  const url = 'https://api.x.com/2/tweets';
   const { oauth, token } = makeOAuth(apiKey, apiSecret, accessToken, accessSecret);
+
   const body = { text };
   if (replyToId) body.reply = { in_reply_to_tweet_id: String(replyToId) };
   if (mediaId) body.media = { media_ids: [String(mediaId)] };
+
   const authHeader = oauth.toHeader(oauth.authorize({ url, method: 'POST' }, token));
-  console.log(`[postTweet] "${text.substring(0,50)}..." ${replyToId ? '↩ '+replyToId : ''} ${mediaId ? '🖼 '+mediaId : ''}`);
+  console.log(`[tweet] "${text.substring(0,50)}..." ${replyToId?'↩ reply:'+replyToId:''} ${mediaId?'🖼 '+mediaId:''}`);
+
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Authorization': authHeader.Authorization, 'Content-Type': 'application/json', 'User-Agent': 'ContentHubPro/3.2' },
+    headers: {
+      'Authorization': authHeader.Authorization,
+      'Content-Type': 'application/json',
+      'User-Agent': 'ContentHubPro/4.0'
+    },
     body: JSON.stringify(body)
   });
+
   const data = await res.json();
-  console.log(`[postTweet] ${res.status}:`, JSON.stringify(data).substring(0, 150));
-  if (!res.ok) throw new Error(`Twitter API ${res.status}: ${data.detail || data.title || JSON.stringify(data)}`);
+  console.log(`[tweet] ${res.status}:`, JSON.stringify(data).substring(0, 200));
+
+  if (!res.ok) {
+    throw new Error(`Twitter API ${res.status}: ${data.detail || data.title || JSON.stringify(data)}`);
+  }
   return data.data;
 }
 
-// ── POST /tweet ──
+// ── POST /tweet — single tweet with optional image + reply ──
 app.post('/tweet', async (req, res) => {
   const { text, apiKey, apiSecret, accessToken, accessSecret, replyToId, imageUrl } = req.body;
-  if (!text || !apiKey || !apiSecret || !accessToken || !accessSecret)
+  if (!text || !apiKey || !apiSecret || !accessToken || !accessSecret) {
     return res.status(400).json({ error: 'Missing required fields' });
+  }
   try {
-    const mediaId = imageUrl ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) : null;
+    const mediaId = imageUrl
+      ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret)
+      : null;
     const tweet = await postTweet(text, replyToId || null, mediaId, apiKey, apiSecret, accessToken, accessSecret);
-    res.json({ success: true, tweetId: tweet.id, tweetUrl: `https://x.com/i/web/status/${tweet.id}`, imageAttached: !!mediaId });
+    res.json({
+      success: true,
+      tweetId: tweet.id,
+      tweetUrl: `https://x.com/i/web/status/${tweet.id}`,
+      imageAttached: !!mediaId
+    });
   } catch (e) {
     console.error('[/tweet]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── POST /thread ──
+// ── POST /thread — used by scheduler ──
 app.post('/thread', async (req, res) => {
   const { tweets, apiKey, apiSecret, accessToken, accessSecret, imageUrl } = req.body;
-  if (!tweets?.length || !apiKey || !apiSecret || !accessToken || !accessSecret)
+  if (!tweets?.length || !apiKey || !apiSecret || !accessToken || !accessSecret) {
     return res.status(400).json({ error: 'Missing required fields' });
+  }
   console.log(`[/thread] ${tweets.length} tweets`);
   const results = [];
   let lastId = null;
@@ -151,10 +167,13 @@ app.post('/thread', async (req, res) => {
       const text = tweets[i];
       if (!text?.trim()) continue;
       if (i > 0) await new Promise(r => setTimeout(r, 3000));
-      const mediaId = (i === 0 && imageUrl) ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) : null;
+      const mediaId = (i === 0 && imageUrl)
+        ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret)
+        : null;
       const tweet = await postTweet(text.trim(), lastId, mediaId, apiKey, apiSecret, accessToken, accessSecret);
       lastId = tweet.id;
       results.push({ index: i+1, tweetId: tweet.id, tweetUrl: `https://x.com/i/web/status/${tweet.id}` });
+      console.log(`[/thread] ✅ ${i+1}/${tweets.length}: ${tweet.id}`);
     }
     res.json({ success: true, threadCount: results.length, firstTweetUrl: results[0]?.tweetUrl, tweets: results });
   } catch (e) {
@@ -217,7 +236,8 @@ async function runScheduler() {
   if (!supabaseUrl || !supabaseKey) return;
   try {
     const db = createClient(supabaseUrl, supabaseKey);
-    const { data: due } = await db.from('scheduled_posts').select('*').eq('status','scheduled').lte('scheduled_at', new Date().toISOString());
+    const { data: due } = await db.from('scheduled_posts').select('*')
+      .eq('status','scheduled').lte('scheduled_at', new Date().toISOString());
     if (!due?.length) return;
     for (const post of due) {
       try {
@@ -228,18 +248,21 @@ async function runScheduler() {
           let lastId = null;
           for (let i = 0; i < tweets.length; i++) {
             if (i > 0) await new Promise(r => setTimeout(r, 3000));
-            const mediaId = (i === 0 && post.image_url) ? await uploadImageToTwitter(post.image_url, post.api_key, post.api_secret, post.access_token, post.access_secret) : null;
+            const mediaId = (i === 0 && post.image_url)
+              ? await uploadImageToTwitter(post.image_url, post.api_key, post.api_secret, post.access_token, post.access_secret)
+              : null;
             const tw = await postTweet(tweets[i], lastId, mediaId, post.api_key, post.api_secret, post.access_token, post.access_secret);
             if (i === 0) firstUrl = `https://x.com/i/web/status/${tw.id}`;
             lastId = tw.id;
           }
         } else {
-          const mediaId = post.image_url ? await uploadImageToTwitter(post.image_url, post.api_key, post.api_secret, post.access_token, post.access_secret) : null;
+          const mediaId = post.image_url
+            ? await uploadImageToTwitter(post.image_url, post.api_key, post.api_secret, post.access_token, post.access_secret)
+            : null;
           const tw = await postTweet(tweets[0] || post.caption, null, mediaId, post.api_key, post.api_secret, post.access_token, post.access_secret);
           firstUrl = `https://x.com/i/web/status/${tw.id}`;
         }
         await db.from('scheduled_posts').update({ status: 'posted', posted_at: new Date().toISOString(), post_url: firstUrl }).eq('id', post.id);
-        console.log(`[Scheduler] ✅ ${post.handle}`);
       } catch (e) {
         await db.from('scheduled_posts').update({ status: 'failed', error_message: e.message }).eq('id', post.id);
         console.error(`[Scheduler] ❌ ${e.message}`);
@@ -250,4 +273,4 @@ async function runScheduler() {
 
 setInterval(runScheduler, 60000);
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ContentHub Server v3.2.0 on port ${PORT}`));
+app.listen(PORT, () => console.log(`ContentHub Server v4.0.0 on port ${PORT}`));
