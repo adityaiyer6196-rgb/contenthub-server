@@ -31,9 +31,7 @@ function makeOAuth(apiKey, apiSecret, accessToken, accessSecret) {
   return { oauth, token: { key: accessToken, secret: accessSecret } };
 }
 
-// ── Upload image via Twitter API v2 media endpoint ──
-// v1.1 (upload.twitter.com/1.1/media/upload) was deprecated June 2025
-// v2 endpoint: POST https://api.x.com/2/media/upload
+// ── FIXED: Upload image via Twitter API v2 media endpoint ──
 async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret) {
   if (!imageUrl) return null;
   try {
@@ -42,8 +40,8 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
     if (imageUrl.startsWith('data:')) {
       // Base64 data URL from device upload
       const parts = imageUrl.split(',');
-      const meta = parts[0]; // e.g. data:image/jpeg;base64
-      mimeType = meta.split(':')[1].split(';')[0]; // e.g. image/jpeg
+      const meta = parts[0];
+      mimeType = meta.split(':')[1].split(';')[0];
       base64Data = parts[1];
       if (!base64Data) throw new Error('Invalid data URL');
     } else {
@@ -61,17 +59,15 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
     }
 
     const sizeKB = Math.round(base64Data.length * 0.75 / 1024);
-    console.log(`[media] Uploading ~${sizeKB}KB (${mimeType}) via v2 endpoint...`);
+    console.log(`[media] Uploading ~${sizeKB}KB (${mimeType}) via v2...`);
 
-    // Twitter API v2 media upload
-    // Uses multipart/form-data — OAuth signs URL only (correct per spec)
     const uploadUrl = 'https://api.x.com/2/media/upload';
     const { oauth, token } = makeOAuth(apiKey, apiSecret, accessToken, accessSecret);
     const authHeader = oauth.toHeader(oauth.authorize({ url: uploadUrl, method: 'POST' }, token));
 
     const form = new FormData();
     form.append('media_data', base64Data);
-    if (mimeType) form.append('media_type', mimeType);
+    form.append('media_category', 'tweet_image');   // ← THIS FIXES IMAGE UPLOAD
 
     const uploadRes = await fetch(uploadUrl, {
       method: 'POST',
@@ -86,16 +82,15 @@ async function uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, ac
       throw new Error(`Media upload failed (${uploadRes.status}): ${uploadData.detail || uploadData.title || JSON.stringify(uploadData)}`);
     }
 
-    // v2 returns media_id in different places depending on response format
     const mediaId = uploadData.data?.id || uploadData.media_id_string || uploadData.id;
-    if (!mediaId) throw new Error('No media_id in response: ' + JSON.stringify(uploadData));
+    if (!mediaId) throw new Error('No media_id in response');
 
     console.log(`[media] ✅ media_id: ${mediaId}`);
     return String(mediaId);
 
   } catch (e) {
     console.error('[media] Upload failed:', e.message);
-    return null; // Don't block the tweet
+    return null;
   }
 }
 
@@ -109,7 +104,7 @@ async function postTweet(text, replyToId, mediaId, apiKey, apiSecret, accessToke
   if (mediaId) body.media = { media_ids: [String(mediaId)] };
 
   const authHeader = oauth.toHeader(oauth.authorize({ url, method: 'POST' }, token));
-  console.log(`[tweet] "${text.substring(0,50)}..." ${replyToId?'↩ reply:'+replyToId:''} ${mediaId?'🖼 '+mediaId:''}`);
+  console.log(`[tweet] "${text.substring(0,50)}..." ${replyToId?'reply:'+replyToId:''} ${mediaId?' '+mediaId:''}`);
 
   const res = await fetch(url, {
     method: 'POST',
@@ -159,118 +154,43 @@ app.post('/thread', async (req, res) => {
   if (!tweets?.length || !apiKey || !apiSecret || !accessToken || !accessSecret) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
-  console.log(`[/thread] ${tweets.length} tweets`);
+  console.log(`[/thread] Starting thread with ${tweets.length} tweets`);
   const results = [];
   let lastId = null;
   try {
     for (let i = 0; i < tweets.length; i++) {
       const text = tweets[i];
       if (!text?.trim()) continue;
+
+      console.log(`[/thread] Posting tweet ${i+1}/${tweets.length} | replyTo: ${lastId || 'none'} | length: ${text.trim().length} chars`);
+
       if (i > 0) await new Promise(r => setTimeout(r, 3000));
+
       const mediaId = (i === 0 && imageUrl)
         ? await uploadImageToTwitter(imageUrl, apiKey, apiSecret, accessToken, accessSecret)
         : null;
+
       const tweet = await postTweet(text.trim(), lastId, mediaId, apiKey, apiSecret, accessToken, accessSecret);
+      
       lastId = tweet.id;
-      results.push({ index: i+1, tweetId: tweet.id, tweetUrl: `https://x.com/i/web/status/${tweet.id}` });
-      console.log(`[/thread] ✅ ${i+1}/${tweets.length}: ${tweet.id}`);
+      results.push({
+        tweetId: tweet.id,
+        tweetUrl: `https://x.com/i/web/status/${tweet.id}`
+      });
     }
-    res.json({ success: true, threadCount: results.length, firstTweetUrl: results[0]?.tweetUrl, tweets: results });
+
+    res.json({ success: true, tweets: results });
   } catch (e) {
-    console.error('[/thread]', e.message);
-    res.status(500).json({ error: e.message, partialResults: results });
+    console.error('[/thread] ERROR:', e.message);
+    res.status(500).json({ 
+      error: e.message, 
+      partialResults: results,
+      note: 'Thread stopped at first error. Check server logs for exact reason.'
+    });
   }
 });
 
-// ── POST /schedule ──
-app.post('/schedule', async (req, res) => {
-  const { supabaseUrl, supabaseKey, scheduleData } = req.body;
-  if (!supabaseUrl || !supabaseKey || !scheduleData) return res.status(400).json({ error: 'Missing fields' });
-  try {
-    const db = createClient(supabaseUrl, supabaseKey);
-    const record = {
-      id: scheduleData.id || crypto.randomUUID(),
-      profile_id: scheduleData.profileId, handle: scheduleData.handle, platform: scheduleData.platform,
-      content_type: scheduleData.contentType || 'tweet',
-      tweets: JSON.stringify(scheduleData.tweets || [scheduleData.text]),
-      caption: scheduleData.caption || '', topic: scheduleData.topic || '',
-      image_url: scheduleData.imageUrl || '', scheduled_at: scheduleData.scheduledAt,
-      timezone: scheduleData.timezone || 'UTC', status: 'scheduled',
-      api_key: scheduleData.apiKey, api_secret: scheduleData.apiSecret,
-      access_token: scheduleData.accessToken, access_secret: scheduleData.accessSecret,
-      created_at: new Date().toISOString()
-    };
-    const { error } = await db.from('scheduled_posts').upsert([record]);
-    if (error) throw new Error(error.message);
-    res.json({ success: true, id: record.id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/schedule/:id', async (req, res) => {
-  const { supabaseUrl, supabaseKey } = req.body;
-  if (!supabaseUrl || !supabaseKey) return res.status(400).json({ error: 'Missing fields' });
-  try {
-    const db = createClient(supabaseUrl, supabaseKey);
-    await db.from('scheduled_posts').update({ status: 'cancelled' }).eq('id', req.params.id);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/schedule', async (req, res) => {
-  const { supabaseUrl, supabaseKey, profileId } = req.query;
-  if (!supabaseUrl || !supabaseKey) return res.status(400).json({ error: 'Missing fields' });
-  try {
-    const db = createClient(supabaseUrl, supabaseKey);
-    let q = db.from('scheduled_posts').select('*').eq('status','scheduled').order('scheduled_at',{ascending:true});
-    if (profileId) q = q.eq('profile_id', profileId);
-    const { data, error } = await q;
-    if (error) throw new Error(error.message);
-    res.json({ success: true, posts: data || [] });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── SCHEDULER ──
-async function runScheduler() {
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseKey = process.env.SUPABASE_KEY;
-  if (!supabaseUrl || !supabaseKey) return;
-  try {
-    const db = createClient(supabaseUrl, supabaseKey);
-    const { data: due } = await db.from('scheduled_posts').select('*')
-      .eq('status','scheduled').lte('scheduled_at', new Date().toISOString());
-    if (!due?.length) return;
-    for (const post of due) {
-      try {
-        await db.from('scheduled_posts').update({ status: 'processing' }).eq('id', post.id);
-        const tweets = JSON.parse(post.tweets || '[]');
-        let firstUrl = '';
-        if (post.content_type === 'thread' && tweets.length > 1) {
-          let lastId = null;
-          for (let i = 0; i < tweets.length; i++) {
-            if (i > 0) await new Promise(r => setTimeout(r, 3000));
-            const mediaId = (i === 0 && post.image_url)
-              ? await uploadImageToTwitter(post.image_url, post.api_key, post.api_secret, post.access_token, post.access_secret)
-              : null;
-            const tw = await postTweet(tweets[i], lastId, mediaId, post.api_key, post.api_secret, post.access_token, post.access_secret);
-            if (i === 0) firstUrl = `https://x.com/i/web/status/${tw.id}`;
-            lastId = tw.id;
-          }
-        } else {
-          const mediaId = post.image_url
-            ? await uploadImageToTwitter(post.image_url, post.api_key, post.api_secret, post.access_token, post.access_secret)
-            : null;
-          const tw = await postTweet(tweets[0] || post.caption, null, mediaId, post.api_key, post.api_secret, post.access_token, post.access_secret);
-          firstUrl = `https://x.com/i/web/status/${tw.id}`;
-        }
-        await db.from('scheduled_posts').update({ status: 'posted', posted_at: new Date().toISOString(), post_url: firstUrl }).eq('id', post.id);
-      } catch (e) {
-        await db.from('scheduled_posts').update({ status: 'failed', error_message: e.message }).eq('id', post.id);
-        console.error(`[Scheduler] ❌ ${e.message}`);
-      }
-    }
-  } catch (e) { console.error('[Scheduler]', e.message); }
-}
-
-setInterval(runScheduler, 60000);
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ContentHub Server v4.0.0 on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 ContentHub Twitter Server running on port ${PORT}`);
+});
